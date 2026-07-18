@@ -1,3 +1,18 @@
+"""
+High-throughput, memory-safe FASTA/FASTQ parsing.
+
+Design goals
+------------
+* Never write the uploaded file to disk — everything happens in an
+  in-memory buffer (io.StringIO / io.BytesIO) so multi-GB uploads don't
+  fill up ephemeral container storage.
+* Stream records one at a time (generator) instead of loading the whole
+  file into a list, so peak memory stays roughly constant regardless of
+  file size.
+* Use Biopython's low-level SimpleFastaParser / FastqGeneralIterator,
+  which are much faster and lighter than SeqIO.parse() for large files
+  because they skip building full SeqRecord objects until needed.
+"""
 from __future__ import annotations
 
 import io
