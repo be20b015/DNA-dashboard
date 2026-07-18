@@ -6,7 +6,15 @@ Run with:
 """
 
 import sys
+import time
 from pathlib import Path
+
+# Cross-platform memory footprint tracking
+try:
+    import resource
+except ImportError:
+    import psutil
+    resource = None
 
 # Allow `core` / `components` package imports when run as `streamlit run app.py`
 sys.path.insert(0, str(Path(__file__).parent))
@@ -73,6 +81,10 @@ def _on_progress(n_records, pct):
     progress_bar.progress(pct)
     status_text.text(f"Parsed {n_records:,} records…")
 
+# --- Performance Metric Tracking ---
+start_time = time.perf_counter()
+peak_memory_kb = 0.0
+
 try:
     for record in stream_with_progress(raw_bytes, progress_callback=_on_progress):
         running.update(record)
@@ -80,13 +92,45 @@ try:
             first_record = record
         if len(records_for_viewer) < 200:  # cap what we keep for the interactive viewer
             records_for_viewer.append(record)
+        
+        # Sample memory footprint periodically during iteration
+        if resource:
+            usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            # Adjust for OS variation: macOS measures in bytes, Linux in kilobytes
+            if sys.platform == "darwin":
+                usage = usage / 1024
+            if usage > peak_memory_kb:
+                peak_memory_kb = usage
+        else:
+            # Fallback wrapper using psutil for Windows systems
+            usage_bytes = psutil.Process().memory_info().rss
+            usage_kb = usage_bytes / 1024
+            if usage_kb > peak_memory_kb:
+                peak_memory_kb = usage_kb
+
 except ValueError as e:
     st.error(str(e))
     st.stop()
 
+end_time = time.perf_counter()
+elapsed_time = end_time - start_time
+
+# Boundary catch to prevent DivisionByZero errors on microscopic files
+elapsed_time_adj = max(elapsed_time, 0.001)
+records_per_sec = running.n_records / elapsed_time_adj
+bases_per_sec = running.total_length / elapsed_time_adj
+peak_memory_mb = peak_memory_kb / 1024
+
 progress_bar.empty()
 status_text.empty()
 st.success(f"Parsed {running.n_records:,} records ({running.total_length:,} total bases).")
+
+# Telemetry Output Container
+st.info(
+    f"⏱️ **Throughput:** {records_per_sec:,.0f} records/sec ({bases_per_sec:,.0f} bases/sec) "
+    f"completed in {elapsed_time:.3f}s | "
+    f"🧠 **Peak Memory Footprint:** {peak_memory_mb:.2f} MB"
+)
 
 # ---------------------------------------------------------------------------
 # KPIs
@@ -162,7 +206,7 @@ if enable_ai:
                 st.error(
                     "Could not load the foundation model. This usually means "
                     "there's no internet access to huggingface.co in this "
-                    f"environment, or `transformers`/`torch` aren't installed.\n\nDetails: {e}"
+                    "environment, or `transformers`/`torch` aren't installed.\n\nDetails: {e}"
                 )
 
 # ---------------------------------------------------------------------------
