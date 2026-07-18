@@ -8,7 +8,7 @@ from typing import Iterator, List, Optional
 from Bio.SeqIO.FastaIO import SimpleFastaParser
 from Bio.SeqIO.QualityIO import FastqGeneralIterator
 
-# Setup lightweight logging for dropped records
+# Setup lightweight logging for dropped or mismatched records
 logger = logging.getLogger(__name__)
 
 
@@ -42,6 +42,23 @@ class SequenceRecord:
         return [10.0 ** (- (ord(char) - 33) / 10.0) for char in self.quality]
 
 
+@dataclass
+class PairedEndStreamStats:
+    total_pairs: int = 0
+    mismatched_pairs: int = 0
+
+    @property
+    def integrity_rate(self) -> float:
+        """
+        Calculates the Paired-End Integrity Rate KPI.
+        Returns a percentage value between 0.0 and 100.0.
+        """
+        if self.total_pairs == 0:
+            return 100.0
+        matched = self.total_pairs - self.mismatched_pairs
+        return round((matched / self.total_pairs) * 100, 2)
+
+
 def _sniff_format(text_head: str) -> str:
     stripped = text_head.lstrip()
     if stripped.startswith(">"):
@@ -65,7 +82,6 @@ def iter_records_from_bytes(raw_bytes: bytes) -> Iterator[SequenceRecord]:
     text_buffer = io.StringIO(raw_bytes.decode("utf-8", errors="ignore"))
 
     if fmt == "fasta":
-        # FASTA files are generally simpler structurally, but we insulate it similarly
         fasta_parser = SimpleFastaParser(text_buffer)
         while True:
             try:
@@ -82,15 +98,15 @@ def iter_records_from_bytes(raw_bytes: bytes) -> Iterator[SequenceRecord]:
         fastq_parser = FastqGeneralIterator(text_buffer)
         while True:
             try:
-                # Manually advancing the iterator allows us to trap errors 
-                # inside the loop structure before it kills the stream context.
+                # Advancing the iterator manually to trap parsing errors 
+                # inside the loop block before it terminates the generator context.
                 res = next(fastq_parser, None)
                 if res is None:
                     break
                 
                 title, seq, qual = res
                 
-                # Internal sanity check: FASTQ sequence and quality lengths must match
+                # Structural check: FASTQ sequence and quality lengths must match
                 if len(seq) != len(qual):
                     raise ValueError(f"Sequence length ({len(seq)}) and Quality length ({len(qual)}) mismatch.")
                 
@@ -102,7 +118,6 @@ def iter_records_from_bytes(raw_bytes: bytes) -> Iterator[SequenceRecord]:
                 logger.error(f"Skipping malformed FASTQ record. Reason: {e}")
                 continue
             except Exception as e:
-                # Catch-all for unexpected low-level errors to guarantee stream survival
                 logger.error(f"Unexpected error parsing record: {e}")
                 continue
 
@@ -131,3 +146,42 @@ def stream_with_progress(raw_bytes: bytes, progress_callback=None, report_every:
 
     if progress_callback:
         progress_callback(count, 1.0)
+
+
+def iter_paired_end(
+    raw_bytes_r1: bytes, 
+    raw_bytes_r2: bytes, 
+    stats_callback=None
+) -> Iterator[tuple[SequenceRecord, SequenceRecord]]:
+    """
+    Simultaneously streams Forward (R1) and Reverse (R2) records in memory.
+    Flags ID mismatches on the fly to track the Paired-End Integrity Rate.
+    
+    Optional stats_callback: a callable that accepts a PairedEndStreamStats object
+    to update dashboards/logs at the end of the run.
+    """
+    stats = PairedEndStreamStats()
+    
+    stream_r1 = iter_records_from_bytes(raw_bytes_r1)
+    stream_r2 = iter_records_from_bytes(raw_bytes_r2)
+
+    # zip terminates safely as soon as the shorter stream runs out
+    for rec1, rec2 in zip(stream_r1, stream_r2):
+        stats.total_pairs += 1
+        
+        # Strip common Illumina/Sanger paired-end suffixes to isolate core ID
+        # e.g., "cluster_1/1" vs "cluster_1/2" or "id_1 1:N:0:1" vs "id_1 2:N:0:1"
+        id1_clean = rec1.id.split('/')[0].split()[0]
+        id2_clean = rec2.id.split('/')[0].split()[0]
+        
+        if id1_clean != id2_clean:
+            stats.mismatched_pairs += 1
+            logger.warning(
+                f"Paired-End Integrity Violation at pair index {stats.total_pairs}: "
+                f"R1 ID '{rec1.id}' does not match R2 ID '{rec2.id}'."
+            )
+            
+        yield rec1, rec2
+
+    if stats_callback:
+        stats_callback(stats)
