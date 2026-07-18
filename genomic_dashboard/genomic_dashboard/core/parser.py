@@ -12,6 +12,9 @@ Design goals
 * Use Biopython's low-level SimpleFastaParser / FastqGeneralIterator,
   which are much faster and lighter than SeqIO.parse() for large files
   because they skip building full SeqRecord objects until needed.
+  
+* Decodes the FASTQ quality string into numeric error probabilities.
+  Fidelity of Quality Score Mapping KPI.
 """
 
 from __future__ import annotations
@@ -41,7 +44,13 @@ class SequenceRecord:
         seq = self.sequence.upper()
         gc = seq.count("G") + seq.count("C")
         return round(100 * gc / len(seq), 2)
-
+    
+    @property
+    def phred_scores(self) -> List[float]:
+        if not self.quality:
+            return []
+        # Standard Phred+33 encoding conversion
+        return [10.0 ** (- (ord(char) - 33) / 10.0) for char in self.quality]
 
 def _sniff_format(text_head: str) -> str:
     stripped = text_head.lstrip()
