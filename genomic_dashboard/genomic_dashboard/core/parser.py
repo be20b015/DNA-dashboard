@@ -1,30 +1,15 @@
-"""
-High-throughput, memory-safe FASTA/FASTQ parsing.
-
-Design goals
-------------
-* Never write the uploaded file to disk — everything happens in an
-  in-memory buffer (io.StringIO / io.BytesIO) so multi-GB uploads don't
-  fill up ephemeral container storage.
-* Stream records one at a time (generator) instead of loading the whole
-  file into a list, so peak memory stays roughly constant regardless of
-  file size.
-* Use Biopython's low-level SimpleFastaParser / FastqGeneralIterator,
-  which are much faster and lighter than SeqIO.parse() for large files
-  because they skip building full SeqRecord objects until needed.
-  
-* Decodes the FASTQ quality string into numeric error probabilities.
-  Fidelity of Quality Score Mapping KPI.
-"""
-
 from __future__ import annotations
 
 import io
+import logging
 from dataclasses import dataclass
-from typing import Iterator, Optional
+from typing import Iterator, List, Optional
 
 from Bio.SeqIO.FastaIO import SimpleFastaParser
 from Bio.SeqIO.QualityIO import FastqGeneralIterator
+
+# Setup lightweight logging for dropped records
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -46,11 +31,16 @@ class SequenceRecord:
         return round(100 * gc / len(seq), 2)
     
     @property
-    def phred_scores(self) -> List[float]:
+    def error_probabilities(self) -> List[float]:
+        """
+        Decodes the FASTQ quality string into numeric error probabilities.
+        Fidelity of Quality Score Mapping KPI.
+        """
         if not self.quality:
             return []
-        # Standard Phred+33 encoding conversion
+        # Standard Phred+33 encoding conversion to p-value
         return [10.0 ** (- (ord(char) - 33) / 10.0) for char in self.quality]
+
 
 def _sniff_format(text_head: str) -> str:
     stripped = text_head.lstrip()
@@ -67,8 +57,7 @@ def _sniff_format(text_head: str) -> str:
 def iter_records_from_bytes(raw_bytes: bytes) -> Iterator[SequenceRecord]:
     """
     Stream SequenceRecord objects from raw uploaded bytes without ever
-    touching disk. `raw_bytes` typically comes from Streamlit's
-    UploadedFile.getvalue(), which itself is already buffered in RAM.
+    touching disk. Robust against isolated malformed records.
     """
     head = raw_bytes[:1024].decode("utf-8", errors="ignore")
     fmt = _sniff_format(head)
@@ -76,13 +65,46 @@ def iter_records_from_bytes(raw_bytes: bytes) -> Iterator[SequenceRecord]:
     text_buffer = io.StringIO(raw_bytes.decode("utf-8", errors="ignore"))
 
     if fmt == "fasta":
-        for title, seq in SimpleFastaParser(text_buffer):
-            record_id = title.split(None, 1)[0]
-            yield SequenceRecord(id=record_id, sequence=seq)
+        # FASTA files are generally simpler structurally, but we insulate it similarly
+        fasta_parser = SimpleFastaParser(text_buffer)
+        while True:
+            try:
+                res = next(fasta_parser, None)
+                if res is None:
+                    break
+                title, seq = res
+                record_id = title.split(None, 1)[0]
+                yield SequenceRecord(id=record_id, sequence=seq)
+            except Exception as e:
+                logger.error(f"Skipping malformed FASTA record: {e}")
+                continue
     else:
-        for title, seq, qual in FastqGeneralIterator(text_buffer):
-            record_id = title.split(None, 1)[0]
-            yield SequenceRecord(id=record_id, sequence=seq, quality=qual)
+        fastq_parser = FastqGeneralIterator(text_buffer)
+        while True:
+            try:
+                # Manually advancing the iterator allows us to trap errors 
+                # inside the loop structure before it kills the stream context.
+                res = next(fastq_parser, None)
+                if res is None:
+                    break
+                
+                title, seq, qual = res
+                
+                # Internal sanity check: FASTQ sequence and quality lengths must match
+                if len(seq) != len(qual):
+                    raise ValueError(f"Sequence length ({len(seq)}) and Quality length ({len(qual)}) mismatch.")
+                
+                record_id = title.split(None, 1)[0]
+                yield SequenceRecord(id=record_id, sequence=seq, quality=qual)
+                
+            except (ValueError, IndexError, AssertionError) as e:
+                # Malformed Record Recovery KPI: Log defect, skip block, keep streaming
+                logger.error(f"Skipping malformed FASTQ record. Reason: {e}")
+                continue
+            except Exception as e:
+                # Catch-all for unexpected low-level errors to guarantee stream survival
+                logger.error(f"Unexpected error parsing record: {e}")
+                continue
 
 
 def stream_with_progress(raw_bytes: bytes, progress_callback=None, report_every: int = 500):
