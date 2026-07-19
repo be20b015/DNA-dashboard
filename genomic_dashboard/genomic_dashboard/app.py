@@ -6,15 +6,7 @@ Run with:
 """
 
 import sys
-import time
 from pathlib import Path
-
-# Cross-platform memory footprint tracking
-try:
-    import resource
-except ImportError:
-    import psutil
-    resource = None
 
 # Allow `core` / `components` package imports when run as `streamlit run app.py`
 sys.path.insert(0, str(Path(__file__).parent))
@@ -81,10 +73,6 @@ def _on_progress(n_records, pct):
     progress_bar.progress(pct)
     status_text.text(f"Parsed {n_records:,} records…")
 
-# --- Performance Metric Tracking ---
-start_time = time.perf_counter()
-peak_memory_kb = 0.0
-
 try:
     for record in stream_with_progress(raw_bytes, progress_callback=_on_progress):
         running.update(record)
@@ -92,45 +80,13 @@ try:
             first_record = record
         if len(records_for_viewer) < 200:  # cap what we keep for the interactive viewer
             records_for_viewer.append(record)
-        
-        # Sample memory footprint periodically during iteration
-        if resource:
-            usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-            # Adjust for OS variation: macOS measures in bytes, Linux in kilobytes
-            if sys.platform == "darwin":
-                usage = usage / 1024
-            if usage > peak_memory_kb:
-                peak_memory_kb = usage
-        else:
-            # Fallback wrapper using psutil for Windows systems
-            usage_bytes = psutil.Process().memory_info().rss
-            usage_kb = usage_bytes / 1024
-            if usage_kb > peak_memory_kb:
-                peak_memory_kb = usage_kb
-
 except ValueError as e:
     st.error(str(e))
     st.stop()
 
-end_time = time.perf_counter()
-elapsed_time = end_time - start_time
-
-# Boundary catch to prevent DivisionByZero errors on microscopic files
-elapsed_time_adj = max(elapsed_time, 0.001)
-records_per_sec = running.n_records / elapsed_time_adj
-bases_per_sec = running.total_length / elapsed_time_adj
-peak_memory_mb = peak_memory_kb / 1024
-
 progress_bar.empty()
 status_text.empty()
 st.success(f"Parsed {running.n_records:,} records ({running.total_length:,} total bases).")
-
-# Telemetry Output Container
-st.info(
-    f"⏱️ **Throughput:** {records_per_sec:,.0f} records/sec ({bases_per_sec:,.0f} bases/sec) "
-    f"completed in {elapsed_time:.3f}s | "
-    f"🧠 **Peak Memory Footprint:** {peak_memory_mb:.2f} MB"
-)
 
 # ---------------------------------------------------------------------------
 # KPIs
@@ -183,15 +139,24 @@ if records_for_viewer:
 if uploaded_pdb is not None:
     st.subheader("3D Protein Structure")
     pdb_text = uploaded_pdb.getvalue().decode("utf-8", errors="ignore")
-    render_structure(pdb_text)
+    render_structure(pdb_pdb_text)
 
 # ---------------------------------------------------------------------------
 # AI-driven embeddings (optional, heavy)
 # ---------------------------------------------------------------------------
 if enable_ai:
     st.subheader("Foundation Model Embeddings")
-    n_to_embed = st.slider("Number of sequences to embed", 1, min(50, len(records_for_viewer) or 1), min(8, len(records_for_viewer) or 1))
-    if st.button("Run embedding extraction"):
+
+    available = len(records_for_viewer)
+    if available <= 1:
+        n_to_embed = available
+        st.caption(f"{available} sequence available — will embed all of it." if available else "No sequences available to embed.")
+    else:
+        max_selectable = min(50, available)
+        default_value = min(8, max_selectable)
+        n_to_embed = st.slider("Number of sequences to embed", 1, max_selectable, default_value)
+
+    if st.button("Run embedding extraction", disabled=(n_to_embed < 1)):
         with st.spinner("Loading model and extracting embeddings (first load may take a while)…"):
             try:
                 from core.model import embed_sequences, load_gfm, gpu_tokenize_hint
@@ -206,7 +171,7 @@ if enable_ai:
                 st.error(
                     "Could not load the foundation model. This usually means "
                     "there's no internet access to huggingface.co in this "
-                    "environment, or `transformers`/`torch` aren't installed.\n\nDetails: {e}"
+                    f"environment, or `transformers`/`torch` aren't installed.\n\nDetails: {e}"
                 )
 
 # ---------------------------------------------------------------------------
