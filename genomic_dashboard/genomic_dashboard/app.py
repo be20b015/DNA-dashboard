@@ -139,15 +139,24 @@ if records_for_viewer:
 if uploaded_pdb is not None:
     st.subheader("3D Protein Structure")
     pdb_text = uploaded_pdb.getvalue().decode("utf-8", errors="ignore")
-    render_structure(pdb_text)
+    render_structure(pdb_pdb_text)
 
 # ---------------------------------------------------------------------------
 # AI-driven embeddings (optional, heavy)
 # ---------------------------------------------------------------------------
 if enable_ai:
     st.subheader("Foundation Model Embeddings")
-    n_to_embed = st.slider("Number of sequences to embed", 1, min(50, len(records_for_viewer) or 1), min(8, len(records_for_viewer) or 1))
-    if st.button("Run embedding extraction"):
+
+    available = len(records_for_viewer)
+    if available <= 1:
+        n_to_embed = available
+        st.caption(f"{available} sequence available — will embed all of it." if available else "No sequences available to embed.")
+    else:
+        max_selectable = min(50, available)
+        default_value = min(8, max_selectable)
+        n_to_embed = st.slider("Number of sequences to embed", 1, max_selectable, default_value)
+
+    if st.button("Run embedding extraction", disabled=(n_to_embed < 1)):
         with st.spinner("Loading model and extracting embeddings (first load may take a while)…"):
             try:
                 from core.model import embed_sequences, load_gfm, gpu_tokenize_hint
